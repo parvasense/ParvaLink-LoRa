@@ -1,19 +1,12 @@
-# ============================================================
-#  HOME NODE  —  Receiver / Base Station
-
-import machine
-import network
-import socket
-import utime
-import ujson
+import machine, network, socket, utime, ujson
 
 # ------------------------------------------------------------------ CONFIG ---
 MY_ADDRESS = 1
 NETWORK_ID = 5
 LORA_BAND  = 865000000
 
-WIFI_SSID     = "Airtel_sidd_7427"         
-WIFI_PASSWORD = "Air@81008"    
+WIFI_SSID     = "Airtel_sidd_7427"
+WIFI_PASSWORD = "Air@81008"
 
 # ------------------------------------------------------------------- UART ---
 uart = machine.UART(
@@ -23,13 +16,8 @@ uart = machine.UART(
     rx=machine.Pin(1)
 )
 
-# ----------------------------------------------------------------- RELAYS ---
-# Active-LOW relay board: value(0) = ON, value(1) = OFF
-relay1 = machine.Pin(2, machine.Pin.OUT, value=1)
-relay2 = machine.Pin(3, machine.Pin.OUT, value=1)
-
 # -------------------------------------------------------------------- LED ---
-led = machine.Pin("LED", machine.Pin.OUT)   # Pico W onboard LED
+led = machine.Pin("LED", machine.Pin.OUT)
 
 def blink_led(times=2, delay_ms=150):
     for _ in range(times):
@@ -55,7 +43,6 @@ latest_data = {
 
 # --------------------------------------------------------- LORA HELPERS ---
 def cmd(c, wait=800):
-    """Send AT command, wait, return response."""
     while uart.any():
         uart.read()
     uart.write((c + "\r\n").encode())
@@ -75,80 +62,87 @@ def lora_init():
     print(cmd("AT+ADDRESS={}".format(MY_ADDRESS)))
     print(cmd("AT+NETWORKID={}".format(NETWORK_ID)))
     print(cmd("AT+BAND={}".format(LORA_BAND)))
-    print(cmd("AT+PARAMETER=9,7,1,12"))   
-    print(cmd("AT+CRFOP=22"))             
+    print(cmd("AT+PARAMETER=9,7,1,12"))
+    print(cmd("AT+CRFOP=22"))
     print("Receiver Ready\n")
 
 # ----------------------------------------------------------- LORA RX ---
 def process_lora():
-    """Read any pending UART bytes, parse +RCV packets, update latest_data."""
     global latest_data
-
     if not uart.any():
         return
-
-    utime.sleep_ms(250)          
+    utime.sleep_ms(250)
     raw = b""
     while uart.any():
         raw += uart.read()
-
     if not raw:
         return
-
     text  = raw.decode('utf-8', 'ignore')
     lines = text.splitlines()
-
     for line in lines:
         line = line.strip()
         if "+RCV=" not in line:
             continue
-
         print("\n[LoRa RX]", line)
-
-        # Format: +RCV=<addr>,<len>,<payload>,<RSSI>,<SNR>
         try:
             header, length, rest = line.split(",", 2)
             payload, rssi_str, snr_str = rest.rsplit(",", 2)
         except ValueError:
             print("Parse error:", line)
             continue
-
         try:
             data = ujson.loads(payload)
             data["rssi"] = rssi_str.strip()
             data["snr"]  = snr_str.strip()
             latest_data  = data
-
-            print("  Timestamp :", data.get("t"))
-            print("  Phases    :", data.get("p"))
-            print("  Temp      :", data.get("T"), "°C")
-            print("  Humidity  :", data.get("H"), "%")
-            print("  Motor     :", data.get("m"))
-            print("  RSSI      :", rssi_str, "  SNR:", snr_str)
-
+            print("  Phases:", data.get("p"))
+            print("  Temp:", data.get("T"), "C  Hum:", data.get("H"), "%")
+            print("  Motor:", data.get("m"))
             blink_led(2, 150)
-
         except Exception as e:
             print("JSON error:", e, "| raw payload:", payload)
 
 # ------------------------------------------------------------ WIFI INIT ---
-def wifi_connect():
+def wifi_connect(retries=3):
     wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    if not wlan.isconnected():
-        print("Connecting to Wi-Fi:", WIFI_SSID)
+
+    for attempt in range(1, retries + 1):
+        print(f"Wi-Fi attempt {attempt}/{retries}")
+
+        # Full reset of the interface
+        wlan.active(False)
+        utime.sleep_ms(1000)          # Give radio time to fully power down
+        wlan.active(True)
+        utime.sleep_ms(1000)          # Give radio time to fully initialize
+
+        print("Connecting to:", WIFI_SSID)
         wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-        timeout = 20
+
+        timeout = 40                  # 40 × 500ms = 20 seconds
         while not wlan.isconnected() and timeout > 0:
+            status = wlan.status()
+            print("Waiting... status:", status)
+
+            # Bail early on unrecoverable errors
+            # network.STAT_WRONG_PASSWORD = 202, STAT_NO_AP_FOUND = 201
+            if status in (202, 201, -1):
+                print("Unrecoverable status, retrying...")
+                break
+
             utime.sleep_ms(500)
             timeout -= 1
-    if wlan.isconnected():
-        ip = wlan.ifconfig()[0]
-        print("Wi-Fi connected. IP:", ip)
-        return ip
-    else:
-        print("Wi-Fi connection FAILED")
-        return None
+
+        if wlan.isconnected():
+            ip = wlan.ifconfig()[0]
+            print("Connected! IP:", ip)
+            return ip
+
+        print("Attempt failed. Status:", wlan.status())
+        wlan.disconnect()
+        utime.sleep_ms(500)
+
+    print("All attempts failed.")
+    return None
 
 # ------------------------------------------------------- HTTP HANDLERS ---
 def parse_query(path):
@@ -167,7 +161,6 @@ def handle_client(conn):
         if not request:
             conn.close()
             return
-
         first_line = request.split("\r\n")[0]
         parts = first_line.split(" ")
         path  = parts[1] if len(parts) >= 2 else "/"
@@ -182,20 +175,46 @@ def handle_client(conn):
                 "Connection: close\r\n\r\n"
             ) + body
 
+        # ---------- /status — motor state only ----------
+        elif path.startswith("/status"):
+            body = ujson.dumps({"m": latest_data.get("m", 0)})
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n"
+            ) + body
+
+        # ---------- /ping ----------
+        elif path.startswith("/ping"):
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Connection: close\r\n\r\npong"
+            )
+
         # ---------- /relay ----------
         elif path.startswith("/relay"):
-            params   = parse_query(path)
-            relay_id = int(params.get("id", 0))
-            state    = int(params.get("state", 1))
+            params = parse_query(path)
+            try:
+                relay_id = int(params.get("id", "0"))
+                state    = int(params.get("state", "1"))
+            except ValueError:
+                relay_id, state = 0, 1
 
-            if relay_id == 1:
-                relay1.value(state)         
-                utime.sleep_ms(1000)
-                relay1.value(1)              
-            elif relay_id == 2:
-                relay2.value(state)
-                utime.sleep_ms(1000)
-                relay2.value(1)
+            payload = ""
+            if relay_id == 1 and state == 0:
+                payload = "RELAY1"
+            elif relay_id == 2 and state == 0:
+                payload = "RELAY2"
+
+            if payload:
+                length        = len(payload)
+                command       = "AT+SEND=2,{},{}".format(length, payload)
+                print("LoRa TX Relay:", payload)
+                response_lora = cmd(command, 2000)
+                print("Response:", response_lora)
+                blink_led(2, 150)
 
             response = (
                 "HTTP/1.1 200 OK\r\n"
@@ -203,7 +222,6 @@ def handle_client(conn):
                 "Connection: close\r\n\r\nOK"
             )
 
-        # ---------- 404 ----------
         else:
             response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found"
 
@@ -226,20 +244,16 @@ def start_server():
 
 # -------------------------------------------------------------- MAIN ---
 lora_init()
-pico_ip    = wifi_connect()
+pico_ip     = wifi_connect()
 server_sock = start_server() if pico_ip else None
 
 while True:
-    # ---- receive LoRa packets ----
     process_lora()
-
-    # ---- serve HTTP requests (non-blocking) ----
     if server_sock:
         try:
             conn, addr = server_sock.accept()
             conn.setblocking(True)
             handle_client(conn)
         except OSError:
-            pass   
-
-    utime.sleep_ms(10)
+            pass
+    utime.sleep_ms(10) 
