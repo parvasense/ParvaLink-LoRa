@@ -8,6 +8,11 @@ LORA_BAND  = 865000000
 WIFI_SSID     = "Airtel_sidd_7427"
 WIFI_PASSWORD = "Air@81008"
 
+# Relay confirmation settings
+RELAY_CONFIRM_TIMEOUT_MS = 8000  # wait up to 8s for m to change
+RELAY_MAX_RETRIES        = 2     # resend up to 2 more times if no confirm
+RELAY_RETRY_DELAY_MS     = 2000  # wait 2s between retries
+
 # ------------------------------------------------------------------- UART ---
 uart = machine.UART(
     0,
@@ -67,8 +72,18 @@ def lora_init():
     print("Receiver Ready\n")
 
 # ----------------------------------------------------------- LORA RX ---
+# Tracks whether a *new* packet has arrived since the last call.
+# Used by send_relay_with_confirm() to distinguish fresh ACKs from stale data.
+_new_packet_received = False
+
 def process_lora():
-    global latest_data
+    """
+    Read any incoming LoRa packet and update latest_data.
+    Sets _new_packet_received = True whenever a valid JSON packet arrives.
+    This flag lets send_relay_with_confirm() ignore pre-existing m values
+    and only confirm on a freshly received ACK from the farm node.
+    """
+    global latest_data, _new_packet_received
     if not uart.any():
         return
     utime.sleep_ms(250)
@@ -95,6 +110,7 @@ def process_lora():
             data["rssi"] = rssi_str.strip()
             data["snr"]  = snr_str.strip()
             latest_data  = data
+            _new_packet_received = True          # ← flag a fresh packet
             print("  Phases:", data.get("p"))
             print("  Temp:", data.get("T"), "C  Hum:", data.get("H"), "%")
             print("  Motor:", data.get("m"))
@@ -102,33 +118,90 @@ def process_lora():
         except Exception as e:
             print("JSON error:", e, "| raw payload:", payload)
 
+# ------------------------------------------------- RELAY WITH CONFIRM ---
+def send_relay_with_confirm(payload, expected_m):
+
+    global _new_packet_received
+
+    length  = len(payload)
+    command = "AT+SEND=2,{},{}".format(length, payload)
+
+    for attempt in range(1, RELAY_MAX_RETRIES + 2):  # attempts: 1, 2, 3
+        print("LoRa TX Relay: {} (attempt {}/{})".format(
+            payload, attempt, RELAY_MAX_RETRIES + 1))
+
+        resp = cmd(command, 2000)
+        print("Response:", resp)
+
+        if "+ERR" in resp:
+            print("  TX error from module ({}), skipping wait — retrying".format(resp))
+            utime.sleep_ms(500)
+            continue
+
+        if "+OK" not in resp:
+            print("  TX rejected by module — skipping wait")
+            utime.sleep_ms(500)
+            continue
+
+        blink_led(2, 150)
+
+        _new_packet_received = False   # reset: ignore any pre-TX buffered data
+        m_before_tx = latest_data.get("m", -1)
+
+        print("  Waiting for farm ACK (expect m={}, currently m={})...".format(
+            expected_m, m_before_tx))
+
+        deadline = utime.ticks_add(utime.ticks_ms(), RELAY_CONFIRM_TIMEOUT_MS)
+
+        while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
+            process_lora()
+
+            # Confirm only if a NEW packet arrived AND it carries expected_m
+            if _new_packet_received and latest_data.get("m", -1) == expected_m:
+                print("  CONFIRMED m={} after attempt {}".format(
+                    expected_m, attempt))
+                return True
+
+            utime.sleep_ms(100)
+
+        # Final check after timeout (covers packets arriving at the last ms)
+        if _new_packet_received and latest_data.get("m", -1) == expected_m:
+            print("  Confirmed on final check")
+            return True
+
+        if attempt <= RELAY_MAX_RETRIES:
+            print("  Not confirmed — retrying in {}ms".format(
+                RELAY_RETRY_DELAY_MS))
+            utime.sleep_ms(RELAY_RETRY_DELAY_MS)
+
+    print("  RELAY FAILED after {} attempts. m={} expected={}".format(
+        RELAY_MAX_RETRIES + 1,
+        latest_data.get("m", -1),
+        expected_m
+    ))
+    return False
+
 # ------------------------------------------------------------ WIFI INIT ---
 def wifi_connect(retries=3):
     wlan = network.WLAN(network.STA_IF)
 
     for attempt in range(1, retries + 1):
-        print(f"Wi-Fi attempt {attempt}/{retries}")
-
-        # Full reset of the interface
+        print("Wi-Fi attempt {}/{}".format(attempt, retries))
         wlan.active(False)
-        utime.sleep_ms(1000)          # Give radio time to fully power down
+        utime.sleep_ms(1000)
         wlan.active(True)
-        utime.sleep_ms(1000)          # Give radio time to fully initialize
+        utime.sleep_ms(1000)
 
         print("Connecting to:", WIFI_SSID)
         wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 
-        timeout = 40                  # 40 × 500ms = 20 seconds
+        timeout = 40
         while not wlan.isconnected() and timeout > 0:
             status = wlan.status()
             print("Waiting... status:", status)
-
-            # Bail early on unrecoverable errors
-            # network.STAT_WRONG_PASSWORD = 202, STAT_NO_AP_FOUND = 201
             if status in (202, 201, -1):
                 print("Unrecoverable status, retrying...")
                 break
-
             utime.sleep_ms(500)
             timeout -= 1
 
@@ -137,11 +210,11 @@ def wifi_connect(retries=3):
             print("Connected! IP:", ip)
             return ip
 
-        print("Attempt failed. Status:", wlan.status())
+        print("Attempt {} failed. Status: {}".format(attempt, wlan.status()))
         wlan.disconnect()
         utime.sleep_ms(500)
 
-    print("All attempts failed.")
+    print("All Wi-Fi attempts failed.")
     return None
 
 # ------------------------------------------------------- HTTP HANDLERS ---
@@ -175,7 +248,7 @@ def handle_client(conn):
                 "Connection: close\r\n\r\n"
             ) + body
 
-        # ---------- /status — motor state only ----------
+        # ---------- /status ----------
         elif path.startswith("/status"):
             body = ujson.dumps({"m": latest_data.get("m", 0)})
             response = (
@@ -190,7 +263,7 @@ def handle_client(conn):
             response = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/plain\r\n"
-                "Connection: close\r\n\r\npong"
+                "Connection: close\r\n\rpong"
             )
 
         # ---------- /relay ----------
@@ -202,24 +275,24 @@ def handle_client(conn):
             except ValueError:
                 relay_id, state = 0, 1
 
-            payload = ""
-            if relay_id == 1 and state == 0:
-                payload = "RELAY1"
-            elif relay_id == 2 and state == 0:
-                payload = "RELAY2"
+            confirmed = False
 
-            if payload:
-                length        = len(payload)
-                command       = "AT+SEND=2,{},{}".format(length, payload)
-                print("LoRa TX Relay:", payload)
-                response_lora = cmd(command, 2000)
-                print("Response:", response_lora)
-                blink_led(2, 150)
+            if relay_id == 1 and state == 0:
+                # START — wait for m=1 confirmation
+                confirmed = send_relay_with_confirm("RELAY1", expected_m=1)
+
+            elif relay_id == 2 and state == 0:
+                # STOP — wait for m=0 confirmation
+                confirmed = send_relay_with_confirm("RELAY2", expected_m=0)
+
+            # "OK" = confirmed, "RETRY" = all retries failed
+            result = "OK" if confirmed else "RETRY"
+            print("Relay result sent to app:", result)
 
             response = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/plain\r\n"
-                "Connection: close\r\n\r\nOK"
+                "Connection: close\r\n\r\n" + result
             )
 
         else:
@@ -256,4 +329,4 @@ while True:
             handle_client(conn)
         except OSError:
             pass
-    utime.sleep_ms(10) 
+    utime.sleep_ms(10)
