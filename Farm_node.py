@@ -7,7 +7,7 @@ NETWORK_ID       = 5
 LORA_BAND        = 865000000
 SEND_INTERVAL_MS = 5000
 
-RELAY_COOLDOWN_MS = 4000
+RELAY_COOLDOWN_MS = 6000
 
 # ------------------------------------------------------------------- UART ---
 uart = machine.UART(
@@ -49,7 +49,6 @@ latest_data = {
 }
 
 # -------------------------------------------- RELAY DEBOUNCE TIMESTAMPS ---
-
 _last_relay_time = {
     "RELAY1": 0,
     "RELAY2": 0,
@@ -57,7 +56,7 @@ _last_relay_time = {
 
 # --------------------------------------------------------- LORA HELPERS ---
 def cmd(c, wait=800):
-    """Send AT command — used for init and TX only. Flushes UART first."""
+
     while uart.any():
         uart.read()
     uart.write((c + "\r\n").encode())
@@ -91,11 +90,16 @@ def read_sensor():
         return 0, 0
 
 def send_lora():
-    """Read sensors, update latest_data, transmit JSON over LoRa."""
-    global latest_data
+
+    global latest_data, _rx_buf
+
+    while uart.any():
+        chunk = uart.read(64)
+        if chunk:
+            _rx_buf += chunk
+
     temp, hum = read_sensor()
 
-    # Replace with real ADC reads if available
     phases = [
         {"a": 10.5, "v": 435.6},
         {"a": 10.2, "v": 437.5},
@@ -107,7 +111,6 @@ def send_lora():
         "p": phases,
         "T": temp,
         "H": hum
-        # "m" intentionally NOT overwritten — preserves relay state
     })
 
     payload  = ujson.dumps(latest_data, separators=(',', ':'))
@@ -124,38 +127,67 @@ def send_lora():
     blink_led(2, 150)
 
 def send_lora_ack():
-    """
-    Send immediate JSON after relay fires (or on duplicate command).
-    Does NOT re-read DHT to avoid 1-2s sensor delay.
-    Uses current T/H already in latest_data.
-    """
-    payload  = ujson.dumps(latest_data, separators=(',', ':'))
-    length   = len(payload)
+
+    global _rx_buf
+
+    payload = ujson.dumps(latest_data, separators=(',', ':'))
+    length  = len(payload)
     if length > 240:
         return
-    command  = "AT+SEND={},{},{}".format(DEST_ADDRESS, length, payload)
+
+    command = "AT+SEND={},{},{}\r\n".format(DEST_ADDRESS, length, payload)
     print("  LoRa ACK TX ({} B): {}".format(length, payload))
-    response = cmd(command, 2500)
-    print("  ACK Response:", response)
+
+    # Write directly — no UART flush
+    uart.write(command.encode())
+
+    # Wait for module to process and respond (typically 300-500ms)
+    utime.sleep_ms(2000)
+
+    # Drain only the TX response bytes, saving all others into _rx_buf
+    resp = b""
+    deadline = utime.ticks_add(utime.ticks_ms(), 500)
+    while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
+        if uart.any():
+            chunk = uart.read(64)
+            if chunk:
+                for line in chunk.split(b"\n"):
+                    line_s = line.strip()
+                    if b"+OK" in line_s or b"+ERR" in line_s:
+                        resp += line_s
+                    elif line_s:
+                        # Preserve non-response data for check_rx()
+                        _rx_buf += line_s + b"\n"
+        utime.sleep_ms(10)
+
+    print("  ACK Response:", resp.decode('utf-8', 'ignore').strip())
 
 # --------------------------------------------------------- RELAY CONTROL ---
 def pulse_relay(relay_pin):
-    """Active-LOW pulse: pull LOW for 1s then release HIGH."""
-    relay_pin.value(0)    # ON
-    utime.sleep_ms(1000)
-    relay_pin.value(1)    # OFF
+
+    global _rx_buf
+    relay_pin.value(0)  # ON
+    deadline = utime.ticks_add(utime.ticks_ms(), 1000)
+    while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
+        
+        if uart.any():
+            chunk = uart.read(64)
+            if chunk:
+                _rx_buf += chunk
+        utime.sleep_ms(10)
+    relay_pin.value(1)  # OFF
 
 # -------------------------------------------- RELAY DEBOUNCE HELPER ---
 def relay_in_cooldown(command):
 
     last = _last_relay_time.get(command, 0)
     if last == 0:
-        return False  # never executed before — allow
+        return False
     elapsed = utime.ticks_diff(utime.ticks_ms(), last)
     return elapsed < RELAY_COOLDOWN_MS
 
 def mark_relay_executed(command):
-    """Record the current timestamp as the last execution time for command."""
+    
     _last_relay_time[command] = utime.ticks_ms()
 
 # ------------------------------------------------------------ RX BUFFER ---
@@ -182,11 +214,9 @@ def check_rx():
         print("[LoRa RX]", line)
 
         # Format: +RCV=<addr>,<len>,<payload>,<rssi>,<snr>
-        # Example: +RCV=1,6,RELAY1,-60,8
         try:
-            body  = line[len("+RCV="):]       # strip +RCV= prefix
+            body  = line[len("+RCV="):]
             parts = body.split(",", 4)
-            # parts[0]=addr  parts[1]=len  parts[2]=payload  [3]=rssi  [4]=snr
             if len(parts) < 3:
                 print("  Too few fields:", parts)
                 continue
@@ -196,7 +226,6 @@ def check_rx():
 
             if payload == "RELAY1":
                 if relay_in_cooldown("RELAY1"):
-
                     elapsed = utime.ticks_diff(
                         utime.ticks_ms(), _last_relay_time["RELAY1"]
                     )
@@ -205,12 +234,12 @@ def check_rx():
                     send_lora_ack()
                 else:
                     print("  -> Motor ON (1s pulse)")
-                    pulse_relay(relay1)
+                    pulse_relay(relay1)           # FIX 2 inside pulse_relay
                     latest_data["m"] = 1
                     mark_relay_executed("RELAY1")
                     blink_led(3, 100)
                     utime.sleep_ms(300)
-                    send_lora_ack()
+                    send_lora_ack()               # FIX 1 inside send_lora_ack
 
             elif payload == "RELAY2":
                 if relay_in_cooldown("RELAY2"):
@@ -222,12 +251,12 @@ def check_rx():
                     send_lora_ack()
                 else:
                     print("  -> Motor OFF (1s pulse)")
-                    pulse_relay(relay2)
+                    pulse_relay(relay2)           # FIX 2 inside pulse_relay
                     latest_data["m"] = 0
                     mark_relay_executed("RELAY2")
                     blink_led(3, 100)
                     utime.sleep_ms(300)
-                    send_lora_ack()
+                    send_lora_ack()               # FIX 1 inside send_lora_ack
 
         except Exception as e:
             print("  RX parse error:", e, "| line:", line)
@@ -239,7 +268,7 @@ last_send = utime.ticks_ms()
 while True:
     now = utime.ticks_ms()
 
-    # Periodic sensor send first (cmd() flushes UART — do before check_rx)
+    # Periodic sensor send (cmd() flushes UART — FIX 3 pre-drains first)
     if utime.ticks_diff(now, last_send) >= SEND_INTERVAL_MS:
         send_lora()
         last_send = utime.ticks_ms()
