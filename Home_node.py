@@ -46,6 +46,9 @@ latest_data = {
     "snr":  0
 }
 
+# ------------------------------------------------- RELAY BUSY LOCK ---
+_relay_in_progress = False
+
 # --------------------------------------------------------- LORA HELPERS ---
 def cmd(c, wait=800):
     while uart.any():
@@ -73,23 +76,19 @@ def lora_init():
 
 # ----------------------------------------------------------- LORA RX ---
 # Tracks whether a *new* packet has arrived since the last call.
-# Used by send_relay_with_confirm() to distinguish fresh ACKs from stale data.
 _new_packet_received = False
 
 def process_lora():
-    """
-    Read any incoming LoRa packet and update latest_data.
-    Sets _new_packet_received = True whenever a valid JSON packet arrives.
-    This flag lets send_relay_with_confirm() ignore pre-existing m values
-    and only confirm on a freshly received ACK from the farm node.
-    """
+
     global latest_data, _new_packet_received
     if not uart.any():
         return
-    utime.sleep_ms(250)
+    # FIX 1: No blocking sleep — read whatever is available right now
     raw = b""
     while uart.any():
-        raw += uart.read()
+        chunk = uart.read()
+        if chunk:
+            raw += chunk
     if not raw:
         return
     text  = raw.decode('utf-8', 'ignore')
@@ -107,10 +106,11 @@ def process_lora():
             continue
         try:
             data = ujson.loads(payload)
-            data["rssi"] = rssi_str.strip()
-            data["snr"]  = snr_str.strip()
+            # FIX 2: Cast to int so RSSI/SNR can be used in math
+            data["rssi"] = int(rssi_str.strip())
+            data["snr"]  = int(snr_str.strip())
             latest_data  = data
-            _new_packet_received = True          # ← flag a fresh packet
+            _new_packet_received = True
             print("  Phases:", data.get("p"))
             print("  Temp:", data.get("T"), "C  Hum:", data.get("H"), "%")
             print("  Motor:", data.get("m"))
@@ -122,6 +122,9 @@ def process_lora():
 def send_relay_with_confirm(payload, expected_m):
 
     global _new_packet_received
+
+    # FIX 3: Reset at entry — discard any stale flag from main loop
+    _new_packet_received = False
 
     length  = len(payload)
     command = "AT+SEND=2,{},{}".format(length, payload)
@@ -145,7 +148,8 @@ def send_relay_with_confirm(payload, expected_m):
 
         blink_led(2, 150)
 
-        _new_packet_received = False   # reset: ignore any pre-TX buffered data
+        # Reset flag AFTER successful TX so only post-TX packets confirm
+        _new_packet_received = False
         m_before_tx = latest_data.get("m", -1)
 
         print("  Waiting for farm ACK (expect m={}, currently m={})...".format(
@@ -155,16 +159,13 @@ def send_relay_with_confirm(payload, expected_m):
 
         while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
             process_lora()
-
-            # Confirm only if a NEW packet arrived AND it carries expected_m
             if _new_packet_received and latest_data.get("m", -1) == expected_m:
                 print("  CONFIRMED m={} after attempt {}".format(
                     expected_m, attempt))
                 return True
-
             utime.sleep_ms(100)
 
-        # Final check after timeout (covers packets arriving at the last ms)
+        # Final check after timeout
         if _new_packet_received and latest_data.get("m", -1) == expected_m:
             print("  Confirmed on final check")
             return True
@@ -229,6 +230,9 @@ def parse_query(path):
     return params
 
 def handle_client(conn):
+
+    global _relay_in_progress
+
     try:
         request = conn.recv(1024).decode("utf-8", "ignore")
         if not request:
@@ -275,17 +279,33 @@ def handle_client(conn):
             except ValueError:
                 relay_id, state = 0, 1
 
+            # FIX 4: Reject duplicate while a relay cycle is in progress
+            if _relay_in_progress:
+                print("Relay busy — duplicate request rejected")
+                response = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Connection: close\r\n\r\nBUSY"
+                )
+                conn.sendall(response.encode())
+                conn.close()
+                return
+
+            _relay_in_progress = True
             confirmed = False
 
-            if relay_id == 1 and state == 0:
-                # START — wait for m=1 confirmation
-                confirmed = send_relay_with_confirm("RELAY1", expected_m=1)
+            try:
+                if relay_id == 1 and state == 0:
+                    # START — wait for m=1 confirmation
+                    confirmed = send_relay_with_confirm("RELAY1", expected_m=1)
 
-            elif relay_id == 2 and state == 0:
-                # STOP — wait for m=0 confirmation
-                confirmed = send_relay_with_confirm("RELAY2", expected_m=0)
+                elif relay_id == 2 and state == 0:
+                    # STOP — wait for m=0 confirmation
+                    confirmed = send_relay_with_confirm("RELAY2", expected_m=0)
+            finally:
+                # Always release lock even if an exception occurs
+                _relay_in_progress = False
 
-            # "OK" = confirmed, "RETRY" = all retries failed
             result = "OK" if confirmed else "RETRY"
             print("Relay result sent to app:", result)
 
@@ -310,7 +330,10 @@ def start_server():
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(addr)
-    s.listen(3)
+    # FIX 5: Increased listen backlog from 3 to 5.
+    # With relay operations taking up to 24s, a backlog of 3 fills up
+    # quickly and causes ECONNRESET on the app side.
+    s.listen(5)
     s.setblocking(False)
     print("HTTP server listening on port 80")
     return s
