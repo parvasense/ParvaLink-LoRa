@@ -7,8 +7,6 @@ NETWORK_ID       = 5
 LORA_BAND        = 865000000
 SEND_INTERVAL_MS = 5000
 
-RELAY_COOLDOWN_MS = 6000
-
 # ------------------------------------------------------------------- UART ---
 uart = machine.UART(
     0,
@@ -22,8 +20,8 @@ sensor = dht.DHT11(machine.Pin(15))
 
 # ----------------------------------------------------------------- RELAYS ---
 # Active-LOW relay board: value(0) = ON, value(1) = OFF
-relay1 = machine.Pin(16, machine.Pin.OUT, value=1)  # Motor ON
-relay2 = machine.Pin(17, machine.Pin.OUT, value=1)  # Motor OFF
+relay1 = machine.Pin(16, machine.Pin.OUT, value=1)  # Motor ON pulse
+relay2 = machine.Pin(17, machine.Pin.OUT, value=1)  # Motor OFF pulse
 
 # -------------------------------------------------------------------- LED ---
 led = machine.Pin("LED", machine.Pin.OUT)
@@ -48,15 +46,9 @@ latest_data = {
     "m": 0   # motor status: 1 = ON, 0 = OFF
 }
 
-# -------------------------------------------- RELAY DEBOUNCE TIMESTAMPS ---
-_last_relay_time = {
-    "RELAY1": 0,
-    "RELAY2": 0,
-}
-
 # --------------------------------------------------------- LORA HELPERS ---
 def cmd(c, wait=800):
-
+    """AT command for init and periodic sensor TX only. Flushes UART first."""
     while uart.any():
         uart.read()
     uart.write((c + "\r\n").encode())
@@ -93,6 +85,7 @@ def send_lora():
 
     global latest_data, _rx_buf
 
+    # Save any incoming bytes before cmd() flushes UART
     while uart.any():
         chunk = uart.read(64)
         if chunk:
@@ -136,15 +129,11 @@ def send_lora_ack():
         return
 
     command = "AT+SEND={},{},{}\r\n".format(DEST_ADDRESS, length, payload)
-    print("  LoRa ACK TX ({} B): {}".format(length, payload))
+    print("  ACK TX ({} B): {}".format(length, payload))
 
-    # Write directly — no UART flush
     uart.write(command.encode())
-
-    # Wait for module to process and respond (typically 300-500ms)
     utime.sleep_ms(2000)
 
-    # Drain only the TX response bytes, saving all others into _rx_buf
     resp = b""
     deadline = utime.ticks_add(utime.ticks_ms(), 500)
     while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
@@ -156,7 +145,6 @@ def send_lora_ack():
                     if b"+OK" in line_s or b"+ERR" in line_s:
                         resp += line_s
                     elif line_s:
-                        # Preserve non-response data for check_rx()
                         _rx_buf += line_s + b"\n"
         utime.sleep_ms(10)
 
@@ -164,12 +152,10 @@ def send_lora_ack():
 
 # --------------------------------------------------------- RELAY CONTROL ---
 def pulse_relay(relay_pin):
-
     global _rx_buf
     relay_pin.value(0)  # ON
     deadline = utime.ticks_add(utime.ticks_ms(), 1000)
     while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
-        
         if uart.any():
             chunk = uart.read(64)
             if chunk:
@@ -177,33 +163,17 @@ def pulse_relay(relay_pin):
         utime.sleep_ms(10)
     relay_pin.value(1)  # OFF
 
-# -------------------------------------------- RELAY DEBOUNCE HELPER ---
-def relay_in_cooldown(command):
-
-    last = _last_relay_time.get(command, 0)
-    if last == 0:
-        return False
-    elapsed = utime.ticks_diff(utime.ticks_ms(), last)
-    return elapsed < RELAY_COOLDOWN_MS
-
-def mark_relay_executed(command):
-    
-    _last_relay_time[command] = utime.ticks_ms()
-
 # ------------------------------------------------------------ RX BUFFER ---
 _rx_buf = b""
 
 def check_rx():
-
     global _rx_buf, latest_data
 
-    # Drain whatever arrived since last tick (non-blocking)
     while uart.any():
         chunk = uart.read(64)
         if chunk:
             _rx_buf += chunk
 
-    # Process complete lines only
     while b"\n" in _rx_buf:
         line, _rx_buf = _rx_buf.split(b"\n", 1)
         line = line.strip().decode("utf-8", "ignore")
@@ -213,7 +183,6 @@ def check_rx():
 
         print("[LoRa RX]", line)
 
-        # Format: +RCV=<addr>,<len>,<payload>,<rssi>,<snr>
         try:
             body  = line[len("+RCV="):]
             parts = body.split(",", 4)
@@ -224,39 +193,39 @@ def check_rx():
             payload = parts[2].strip()
             print("  Payload:", payload)
 
+            # ----------------------------------------------------------
+            # RELAY1 — turn motor ON
+            # ----------------------------------------------------------
             if payload == "RELAY1":
-                if relay_in_cooldown("RELAY1"):
-                    elapsed = utime.ticks_diff(
-                        utime.ticks_ms(), _last_relay_time["RELAY1"]
-                    )
-                    print("  -> RELAY1 duplicate ({}ms ago) — skipping pulse, resending ACK".format(elapsed))
-                    utime.sleep_ms(300)
+                if latest_data["m"] == 1:
+                    print("  -> RELAY1 ignored: motor already ON (m=1) — resending ACK")
+                    utime.sleep_ms(100)
                     send_lora_ack()
                 else:
+                    # Motor is OFF — this is a genuine new ON command.
                     print("  -> Motor ON (1s pulse)")
-                    pulse_relay(relay1)           # FIX 2 inside pulse_relay
+                    pulse_relay(relay1)
                     latest_data["m"] = 1
-                    mark_relay_executed("RELAY1")
                     blink_led(3, 100)
-                    utime.sleep_ms(300)
-                    send_lora_ack()               # FIX 1 inside send_lora_ack
+                    utime.sleep_ms(100)
+                    send_lora_ack()
 
+            # ----------------------------------------------------------
+            # RELAY2 — turn motor OFF
+            # ----------------------------------------------------------
             elif payload == "RELAY2":
-                if relay_in_cooldown("RELAY2"):
-                    elapsed = utime.ticks_diff(
-                        utime.ticks_ms(), _last_relay_time["RELAY2"]
-                    )
-                    print("  -> RELAY2 duplicate ({}ms ago) — skipping pulse, resending ACK".format(elapsed))
-                    utime.sleep_ms(300)
+                if latest_data["m"] == 0:
+                    print("  -> RELAY2 ignored: motor already OFF (m=0) — resending ACK")
+                    utime.sleep_ms(100)
                     send_lora_ack()
                 else:
+                    # Motor is ON — this is a genuine new OFF command.
                     print("  -> Motor OFF (1s pulse)")
-                    pulse_relay(relay2)           # FIX 2 inside pulse_relay
+                    pulse_relay(relay2)
                     latest_data["m"] = 0
-                    mark_relay_executed("RELAY2")
                     blink_led(3, 100)
-                    utime.sleep_ms(300)
-                    send_lora_ack()               # FIX 1 inside send_lora_ack
+                    utime.sleep_ms(100)
+                    send_lora_ack()
 
         except Exception as e:
             print("  RX parse error:", e, "| line:", line)
@@ -268,12 +237,10 @@ last_send = utime.ticks_ms()
 while True:
     now = utime.ticks_ms()
 
-    # Periodic sensor send (cmd() flushes UART — FIX 3 pre-drains first)
     if utime.ticks_diff(now, last_send) >= SEND_INTERVAL_MS:
         send_lora()
         last_send = utime.ticks_ms()
 
-    # Passive relay listener (never blocks, never flushes UART)
     check_rx()
 
     utime.sleep_ms(50)
