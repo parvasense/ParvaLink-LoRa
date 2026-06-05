@@ -75,7 +75,6 @@ def lora_init():
     print("Receiver Ready\n")
 
 # ----------------------------------------------------------- LORA RX ---
-# Tracks whether a *new* packet has arrived since the last call.
 _new_packet_received = False
 
 def process_lora():
@@ -162,12 +161,14 @@ def send_relay_with_confirm(payload, expected_m):
             if _new_packet_received and latest_data.get("m", -1) == expected_m:
                 print("  CONFIRMED m={} after attempt {}".format(
                     expected_m, attempt))
+                _new_packet_received = False
                 return True
             utime.sleep_ms(100)
 
         # Final check after timeout
         if _new_packet_received and latest_data.get("m", -1) == expected_m:
             print("  Confirmed on final check")
+            _new_packet_received = False
             return True
 
         if attempt <= RELAY_MAX_RETRIES:
@@ -230,7 +231,6 @@ def parse_query(path):
     return params
 
 def handle_client(conn):
-
     global _relay_in_progress
 
     try:
@@ -275,11 +275,10 @@ def handle_client(conn):
             params = parse_query(path)
             try:
                 relay_id = int(params.get("id", "0"))
-                state    = int(params.get("state", "1"))
             except ValueError:
-                relay_id, state = 0, 1
+                relay_id = 0
 
-            # FIX 4: Reject duplicate while a relay cycle is in progress
+            # Reject duplicate while a relay cycle is in progress
             if _relay_in_progress:
                 print("Relay busy — duplicate request rejected")
                 response = (
@@ -295,13 +294,17 @@ def handle_client(conn):
             confirmed = False
 
             try:
-                if relay_id == 1 and state == 0:
-                    # START — wait for m=1 confirmation
+                if relay_id == 1:
+                    # ON — send RELAY1, wait for m=1
                     confirmed = send_relay_with_confirm("RELAY1", expected_m=1)
 
-                elif relay_id == 2 and state == 0:
-                    # STOP — wait for m=0 confirmation
+                elif relay_id == 2:
+                    # OFF — send RELAY2, wait for m=0
                     confirmed = send_relay_with_confirm("RELAY2", expected_m=0)
+
+                else:
+                    print("Unknown relay_id:", relay_id)
+
             finally:
                 # Always release lock even if an exception occurs
                 _relay_in_progress = False
@@ -330,9 +333,6 @@ def start_server():
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(addr)
-    # FIX 5: Increased listen backlog from 3 to 5.
-    # With relay operations taking up to 24s, a backlog of 3 fills up
-    # quickly and causes ECONNRESET on the app side.
     s.listen(5)
     s.setblocking(False)
     print("HTTP server listening on port 80")
