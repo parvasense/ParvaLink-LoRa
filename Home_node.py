@@ -1,17 +1,21 @@
 import machine, network, socket, utime, ujson
 
 # ------------------------------------------------------------------ CONFIG ---
-MY_ADDRESS = 1
-NETWORK_ID = 5
-LORA_BAND  = 865000000
+MY_ADDRESS    = 1
+FARM_ADDRESS  = 2
+NETWORK_ID    = 5
+LORA_BAND     = 865000000
 
 WIFI_SSID     = "Airtel_sidd_7427"
 WIFI_PASSWORD = "Air@81008"
 
-# Relay confirmation settings
-RELAY_CONFIRM_TIMEOUT_MS = 8000  # wait up to 8s for m to change
-RELAY_MAX_RETRIES        = 2     # resend up to 2 more times if no confirm
-RELAY_RETRY_DELAY_MS     = 2000  # wait 2s between retries
+# ---- NEW: async resend tuning — replaces RELAY_CONFIRM_TIMEOUT_MS/RETRIES ----
+# These no longer block anything. They just control how often an unconfirmed
+# command gets re-transmitted in the background, and for how long, before
+# we stop auto-resending (the command stays "PENDING" forever after that —
+# never "FAILED" — the user can manually trigger a resend of the same ID).
+ACK_WAIT_BEFORE_RESEND_MS = 1500
+MAX_AUTO_RESENDS          = 4
 
 # ------------------------------------------------------------------- UART ---
 uart = machine.UART(
@@ -46,11 +50,19 @@ latest_data = {
     "snr":  0
 }
 
-# ------------------------------------------------- RELAY BUSY LOCK ---
-_relay_in_progress = False
+# ----------------------------------------------- NEW: COMMAND TRACKING ---
+# Replaces _relay_in_progress. Tracks exactly one in-flight relay command
+# by its unique id. The farm node is idempotent on this id (won't re-fire
+# the relay for a repeat), so resends — automatic or user-triggered — are
+# always safe, regardless of how long they take to resolve.
+next_cmd_id = 1
+pending_cmd = None   # dict: {id, action, confirmed, status, last_sent, resends}
 
 # --------------------------------------------------------- LORA HELPERS ---
 def cmd(c, wait=800):
+    """AT command helper for INIT ONLY. Flushes RX first — safe at boot
+    since nothing meaningful is buffered yet. Do not use this for sending
+    relay commands (see send_relay_command below)."""
     while uart.any():
         uart.read()
     uart.write((c + "\r\n").encode())
@@ -74,15 +86,35 @@ def lora_init():
     print(cmd("AT+CRFOP=22"))
     print("Receiver Ready\n")
 
+# --------------------------------------------------- NEW: COMMAND SEND ---
+def send_relay_command(action, cmd_id):
+    """
+    Fire-and-forget send of CMD,<id>,<action>. Deliberately does NOT use
+    cmd() — no RX flush — so we never throw away a concurrently-arriving
+    ACK or telemetry packet just because we're issuing a relay command.
+    Does not wait for or check the module's own local +OK/+ERR; that's
+    fine, because correctness depends only on the farm node's idempotent
+    handling of cmd_id, not on confirming this local TX succeeded.
+    """
+    payload = "CMD,{},{}".format(cmd_id, action)
+    line = "AT+SEND={},{},{}\r\n".format(FARM_ADDRESS, len(payload), payload)
+    print("LoRa TX: {}".format(payload))
+    uart.write(line.encode())
+
 # ----------------------------------------------------------- LORA RX ---
-_new_packet_received = False
+_new_packet_received = False   # freshness flag for telemetry display only
 
 def process_lora():
+    """
+    Drains UART, handles two kinds of +RCV= payloads:
+      - JSON telemetry (starts with '{')   -> updates latest_data
+      - "ACK,<id>,<state>,<status>"        -> resolves pending_cmd by id
+    """
+    global latest_data, _new_packet_received, pending_cmd
 
-    global latest_data, _new_packet_received
     if not uart.any():
         return
-    # FIX 1: No blocking sleep — read whatever is available right now
+
     raw = b""
     while uart.any():
         chunk = uart.read()
@@ -90,12 +122,15 @@ def process_lora():
             raw += chunk
     if not raw:
         return
+
     text  = raw.decode('utf-8', 'ignore')
     lines = text.splitlines()
+
     for line in lines:
         line = line.strip()
         if "+RCV=" not in line:
             continue
+
         print("\n[LoRa RX]", line)
         try:
             header, length, rest = line.split(",", 2)
@@ -103,9 +138,42 @@ def process_lora():
         except ValueError:
             print("Parse error:", line)
             continue
+
+        payload = payload.strip()
+
+        # ---------------- ACK,<id>,<state>,<status> ----------------
+        if payload.startswith("ACK,"):
+            try:
+                parts = payload.split(",")
+                ack_id     = int(parts[1])
+                ack_state  = int(parts[2])
+                ack_status = parts[3]
+            except (IndexError, ValueError):
+                print("  ACK parse error:", payload)
+                continue
+
+            print("  ACK id={} state={} status={}".format(
+                ack_id, ack_state, ack_status))
+
+            # Motor state from an ACK is always trustworthy, even if it's
+            # not the id we're currently tracking (e.g. a very late ACK
+            # for a superseded command) — reflect it either way.
+            latest_data["m"] = ack_state
+
+            if pending_cmd and ack_id == pending_cmd["id"]:
+                pending_cmd["confirmed"] = True
+                pending_cmd["status"]    = ack_status
+                print("  -> Pending command {} resolved ({})".format(
+                    ack_id, ack_status))
+            else:
+                print("  -> ACK id does not match current pending (or none pending) — state updated only")
+
+            blink_led(2, 150)
+            continue
+
+        # ---------------- JSON telemetry ----------------
         try:
             data = ujson.loads(payload)
-            # FIX 2: Cast to int so RSSI/SNR can be used in math
             data["rssi"] = int(rssi_str.strip())
             data["snr"]  = int(snr_str.strip())
             latest_data  = data
@@ -117,71 +185,34 @@ def process_lora():
         except Exception as e:
             print("JSON error:", e, "| raw payload:", payload)
 
-# ------------------------------------------------- RELAY WITH CONFIRM ---
-def send_relay_with_confirm(payload, expected_m):
+# -------------------------------------------- NEW: BACKGROUND RESEND ---
+def check_pending_resend():
+    """
+    Called every main-loop tick. If a command is still unconfirmed and
+    enough time has passed since the last send, resend the SAME id —
+    never a new one — so the farm node's idempotency guard makes this
+    completely safe no matter how many times it fires.
+    After MAX_AUTO_RESENDS, stop resending automatically; the command
+    stays PENDING (not FAILED) until either a late ACK resolves it or
+    the user triggers a manual resend via another /relay press.
+    """
+    global pending_cmd
 
-    global _new_packet_received
+    if not pending_cmd or pending_cmd["confirmed"]:
+        return
 
-    # FIX 3: Reset at entry — discard any stale flag from main loop
-    _new_packet_received = False
+    now = utime.ticks_ms()
+    if utime.ticks_diff(now, pending_cmd["last_sent"]) < ACK_WAIT_BEFORE_RESEND_MS:
+        return
 
-    length  = len(payload)
-    command = "AT+SEND=2,{},{}".format(length, payload)
+    if pending_cmd["resends"] >= MAX_AUTO_RESENDS:
+        return   # stays PENDING — no further auto-action
 
-    for attempt in range(1, RELAY_MAX_RETRIES + 2):  # attempts: 1, 2, 3
-        print("LoRa TX Relay: {} (attempt {}/{})".format(
-            payload, attempt, RELAY_MAX_RETRIES + 1))
-
-        resp = cmd(command, 2000)
-        print("Response:", resp)
-
-        if "+ERR" in resp:
-            print("  TX error from module ({}), skipping wait — retrying".format(resp))
-            utime.sleep_ms(500)
-            continue
-
-        if "+OK" not in resp:
-            print("  TX rejected by module — skipping wait")
-            utime.sleep_ms(500)
-            continue
-
-        blink_led(2, 150)
-
-        # Reset flag AFTER successful TX so only post-TX packets confirm
-        _new_packet_received = False
-        m_before_tx = latest_data.get("m", -1)
-
-        print("  Waiting for farm ACK (expect m={}, currently m={})...".format(
-            expected_m, m_before_tx))
-
-        deadline = utime.ticks_add(utime.ticks_ms(), RELAY_CONFIRM_TIMEOUT_MS)
-
-        while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
-            process_lora()
-            if _new_packet_received and latest_data.get("m", -1) == expected_m:
-                print("  CONFIRMED m={} after attempt {}".format(
-                    expected_m, attempt))
-                _new_packet_received = False
-                return True
-            utime.sleep_ms(100)
-
-        # Final check after timeout
-        if _new_packet_received and latest_data.get("m", -1) == expected_m:
-            print("  Confirmed on final check")
-            _new_packet_received = False
-            return True
-
-        if attempt <= RELAY_MAX_RETRIES:
-            print("  Not confirmed — retrying in {}ms".format(
-                RELAY_RETRY_DELAY_MS))
-            utime.sleep_ms(RELAY_RETRY_DELAY_MS)
-
-    print("  RELAY FAILED after {} attempts. m={} expected={}".format(
-        RELAY_MAX_RETRIES + 1,
-        latest_data.get("m", -1),
-        expected_m
-    ))
-    return False
+    pending_cmd["resends"] += 1
+    print("Auto-resend #{} for cmd id={}".format(
+        pending_cmd["resends"], pending_cmd["id"]))
+    send_relay_command(pending_cmd["action"], pending_cmd["id"])
+    pending_cmd["last_sent"] = now
 
 # ------------------------------------------------------------ WIFI INIT ---
 def wifi_connect(retries=3):
@@ -231,7 +262,7 @@ def parse_query(path):
     return params
 
 def handle_client(conn):
-    global _relay_in_progress
+    global pending_cmd, next_cmd_id
 
     try:
         request = conn.recv(1024).decode("utf-8", "ignore")
@@ -252,9 +283,15 @@ def handle_client(conn):
                 "Connection: close\r\n\r\n"
             ) + body
 
-        # ---------- /status ----------
+        # ---------- /status — NOW also reports pending command state ----------
         elif path.startswith("/status"):
-            body = ujson.dumps({"m": latest_data.get("m", 0)})
+            status_obj = {"m": latest_data.get("m", 0)}
+            if pending_cmd:
+                status_obj["pending_id"]     = pending_cmd["id"]
+                status_obj["pending_action"] = pending_cmd["action"]
+                status_obj["confirmed"]      = pending_cmd["confirmed"]
+                status_obj["ack_status"]     = pending_cmd["status"]
+            body = ujson.dumps(status_obj)
             response = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
@@ -267,10 +304,10 @@ def handle_client(conn):
             response = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/plain\r\n"
-                "Connection: close\r\n\rpong"
+                "Connection: close\r\n\r\npong"
             )
 
-        # ---------- /relay ----------
+        # ---------- /relay — NOW non-blocking, returns instantly ----------
         elif path.startswith("/relay"):
             params = parse_query(path)
             try:
@@ -278,45 +315,54 @@ def handle_client(conn):
             except ValueError:
                 relay_id = 0
 
-            # Reject duplicate while a relay cycle is in progress
-            if _relay_in_progress:
-                print("Relay busy — duplicate request rejected")
+            if relay_id == 1:
+                action = "RELAY1"
+            elif relay_id == 2:
+                action = "RELAY2"
+            else:
                 response = (
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/plain\r\n"
-                    "Connection: close\r\n\r\nBUSY"
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Connection: close\r\n\r\nUnknown relay id"
                 )
                 conn.sendall(response.encode())
                 conn.close()
                 return
 
-            _relay_in_progress = True
-            confirmed = False
+            if pending_cmd and not pending_cmd["confirmed"] and pending_cmd["action"] == action:
+                # Same action already in flight — this is the user pressing
+                # the same button again. Do NOT allocate a new id (that
+                # would just be a second duplicate to track). Instead,
+                # nudge an immediate resend of the SAME id — completely
+                # safe thanks to farm-node idempotency, and satisfies
+                # "prevent button spamming" without rejecting the press.
+                print("Action already pending (id={}) — forcing resend, no new id".format(
+                    pending_cmd["id"]))
+                send_relay_command(pending_cmd["action"], pending_cmd["id"])
+                pending_cmd["last_sent"] = utime.ticks_ms()
+                body = ujson.dumps({"status": "PENDING", "cmd_id": pending_cmd["id"]})
+            else:
+                cmd_id = next_cmd_id
+                next_cmd_id = (next_cmd_id + 1) % 65536
+                pending_cmd = {
+                    "id": cmd_id,
+                    "action": action,
+                    "confirmed": False,
+                    "status": None,
+                    "last_sent": utime.ticks_ms(),
+                    "resends": 0
+                }
+                send_relay_command(action, cmd_id)
+                body = ujson.dumps({"status": "PENDING", "cmd_id": cmd_id})
 
-            try:
-                if relay_id == 1:
-                    # ON — send RELAY1, wait for m=1
-                    confirmed = send_relay_with_confirm("RELAY1", expected_m=1)
-
-                elif relay_id == 2:
-                    # OFF — send RELAY2, wait for m=0
-                    confirmed = send_relay_with_confirm("RELAY2", expected_m=0)
-
-                else:
-                    print("Unknown relay_id:", relay_id)
-
-            finally:
-                # Always release lock even if an exception occurs
-                _relay_in_progress = False
-
-            result = "OK" if confirmed else "RETRY"
-            print("Relay result sent to app:", result)
-
+            # Returns IMMEDIATELY — no 8s/28s wait, no blocking the socket.
+            # The app is expected to poll /status?... using cmd_id to learn
+            # when it resolves, however long that actually takes.
             response = (
                 "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain\r\n"
-                "Connection: close\r\n\r\n" + result
-            )
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n"
+            ) + body
 
         else:
             response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found"
@@ -345,6 +391,7 @@ server_sock = start_server() if pico_ip else None
 
 while True:
     process_lora()
+    check_pending_resend()      # NEW — background resend, never blocks
     if server_sock:
         try:
             conn, addr = server_sock.accept()
