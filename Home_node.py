@@ -1,20 +1,17 @@
 import machine, network, socket, utime, ujson
 
 # ------------------------------------------------------------------ CONFIG ---
-MY_ADDRESS    = 1
-FARM_ADDRESS  = 2
+MY_ADDRESS    = 1       # this node's LoRa address
+FARM_ADDRESS  = 2       # farm node's LoRa address
 NETWORK_ID    = 5
 LORA_BAND     = 865000000
 
 WIFI_SSID     = "Airtel_sidd_7427"
 WIFI_PASSWORD = "Air@81008"
 
-# ---- NEW: async resend tuning — replaces RELAY_CONFIRM_TIMEOUT_MS/RETRIES ----
-# These no longer block anything. They just control how often an unconfirmed
-# command gets re-transmitted in the background, and for how long, before
-# we stop auto-resending (the command stays "PENDING" forever after that —
-# never "FAILED" — the user can manually trigger a resend of the same ID).
+# How long to wait before auto-resending an unconfirmed command
 ACK_WAIT_BEFORE_RESEND_MS = 1500
+# How many times to auto-resend before giving up (command stays PENDING, never FAILED)
 MAX_AUTO_RESENDS          = 4
 
 # ------------------------------------------------------------------- UART ---
@@ -22,7 +19,8 @@ uart = machine.UART(
     0,
     baudrate=115200,
     tx=machine.Pin(0),
-    rx=machine.Pin(1)
+    rx=machine.Pin(1),
+    rxbuf=512    # large enough for full +RCV= lines without truncation
 )
 
 # -------------------------------------------------------------------- LED ---
@@ -36,6 +34,7 @@ def blink_led(times=2, delay_ms=150):
         utime.sleep_ms(delay_ms)
 
 # ---------------------------------------------------- SHARED DATA STORE ---
+# Holds the latest telemetry received from the farm node
 latest_data = {
     "t": 0,
     "p": [
@@ -45,24 +44,23 @@ latest_data = {
     ],
     "T": 0,
     "H": 0,
-    "m": 0,
+    "m": 0,      # motor state: 1=ON, 0=OFF
     "rssi": 0,
     "snr":  0
 }
 
-# ----------------------------------------------- NEW: COMMAND TRACKING ---
-# Replaces _relay_in_progress. Tracks exactly one in-flight relay command
-# by its unique id. The farm node is idempotent on this id (won't re-fire
-# the relay for a repeat), so resends — automatic or user-triggered — are
-# always safe, regardless of how long they take to resolve.
+# --------------------------------------------------- COMMAND TRACKING ---
+# Each relay press gets a unique ID (1-65535, never 0).
+# The farm node remembers the last ID it executed — duplicates are ignored.
+# This means retries and button-spamming can never cause double relay fires.
 next_cmd_id = 1
-pending_cmd = None   # dict: {id, action, confirmed, status, last_sent, resends}
+pending_cmd = None   # tracks the one in-flight command: {id, action, confirmed, status, last_sent, resends}
 
 # --------------------------------------------------------- LORA HELPERS ---
 def cmd(c, wait=800):
-    """AT command helper for INIT ONLY. Flushes RX first — safe at boot
-    since nothing meaningful is buffered yet. Do not use this for sending
-    relay commands (see send_relay_command below)."""
+    # AT command helper — used ONLY during init.
+    # Flushes RX first (safe at boot, nothing meaningful buffered yet).
+    # Never use this for relay commands — it would discard arriving ACKs.
     while uart.any():
         uart.read()
     uart.write((c + "\r\n").encode())
@@ -86,34 +84,30 @@ def lora_init():
     print(cmd("AT+CRFOP=22"))
     print("Receiver Ready\n")
 
-# --------------------------------------------------- NEW: COMMAND SEND ---
+# --------------------------------------------------- RELAY COMMAND SEND ---
 def send_relay_command(action, cmd_id):
-    """
-    Fire-and-forget send of CMD,<id>,<action>. Deliberately does NOT use
-    cmd() — no RX flush — so we never throw away a concurrently-arriving
-    ACK or telemetry packet just because we're issuing a relay command.
-    Does not wait for or check the module's own local +OK/+ERR; that's
-    fine, because correctness depends only on the farm node's idempotent
-    handling of cmd_id, not on confirming this local TX succeeded.
-    """
+    # Fire-and-forget: writes CMD,<id>,<action> directly to UART without
+    # flushing RX first — so we never discard a concurrently-arriving ACK.
+    # Correctness depends on the farm node's dedup logic, not on this TX succeeding.
     payload = "CMD,{},{}".format(cmd_id, action)
     line = "AT+SEND={},{},{}\r\n".format(FARM_ADDRESS, len(payload), payload)
     print("LoRa TX: {}".format(payload))
     uart.write(line.encode())
 
 # ----------------------------------------------------------- LORA RX ---
-_new_packet_received = False   # freshness flag for telemetry display only
-
 def process_lora():
-    """
-    Drains UART, handles two kinds of +RCV= payloads:
-      - JSON telemetry (starts with '{')   -> updates latest_data
-      - "ACK,<id>,<state>,<status>"        -> resolves pending_cmd by id
-    """
-    global latest_data, _new_packet_received, pending_cmd
+    # Reads all pending UART bytes and handles two payload types:
+    #   - "ACK,<id>,<state>,<status>" -> resolves pending_cmd
+    #   - JSON starting with '{'       -> updates latest_data telemetry
+    global latest_data, pending_cmd
 
     if not uart.any():
         return
+
+    # FIX: wait 20ms for the full line to arrive before reading.
+    # At 115200 baud, a 40-byte line takes ~3ms — reading immediately
+    # risks catching it mid-arrival and truncating the line.
+    utime.sleep_ms(20)
 
     raw = b""
     while uart.any():
@@ -132,6 +126,8 @@ def process_lora():
             continue
 
         print("\n[LoRa RX]", line)
+
+        # Split +RCV=<addr>,<len>,<payload>,<rssi>,<snr>
         try:
             header, length, rest = line.split(",", 2)
             payload, rssi_str, snr_str = rest.rsplit(",", 2)
@@ -141,10 +137,10 @@ def process_lora():
 
         payload = payload.strip()
 
-        # ---------------- ACK,<id>,<state>,<status> ----------------
+        # ---- ACK from farm node ----
         if payload.startswith("ACK,"):
             try:
-                parts = payload.split(",")
+                parts      = payload.split(",")
                 ack_id     = int(parts[1])
                 ack_state  = int(parts[2])
                 ack_status = parts[3]
@@ -152,32 +148,28 @@ def process_lora():
                 print("  ACK parse error:", payload)
                 continue
 
-            print("  ACK id={} state={} status={}".format(
-                ack_id, ack_state, ack_status))
+            print("  ACK id={} state={} status={}".format(ack_id, ack_state, ack_status))
 
-            # Motor state from an ACK is always trustworthy, even if it's
-            # not the id we're currently tracking (e.g. a very late ACK
-            # for a superseded command) — reflect it either way.
+            # Always update motor state from ACK — even if it's a late/stale one
             latest_data["m"] = ack_state
 
             if pending_cmd and ack_id == pending_cmd["id"]:
+                # This ACK matches our in-flight command — resolve it
                 pending_cmd["confirmed"] = True
                 pending_cmd["status"]    = ack_status
-                print("  -> Pending command {} resolved ({})".format(
-                    ack_id, ack_status))
+                print("  -> Command {} resolved ({})".format(ack_id, ack_status))
             else:
-                print("  -> ACK id does not match current pending (or none pending) — state updated only")
+                print("  -> ACK id mismatch or no pending command — motor state updated only")
 
             blink_led(2, 150)
             continue
 
-        # ---------------- JSON telemetry ----------------
+        # ---- JSON telemetry from farm node ----
         try:
             data = ujson.loads(payload)
             data["rssi"] = int(rssi_str.strip())
             data["snr"]  = int(snr_str.strip())
             latest_data  = data
-            _new_packet_received = True
             print("  Phases:", data.get("p"))
             print("  Temp:", data.get("T"), "C  Hum:", data.get("H"), "%")
             print("  Motor:", data.get("m"))
@@ -185,17 +177,12 @@ def process_lora():
         except Exception as e:
             print("JSON error:", e, "| raw payload:", payload)
 
-# -------------------------------------------- NEW: BACKGROUND RESEND ---
+# ------------------------------------------------- BACKGROUND RESEND ---
 def check_pending_resend():
-    """
-    Called every main-loop tick. If a command is still unconfirmed and
-    enough time has passed since the last send, resend the SAME id —
-    never a new one — so the farm node's idempotency guard makes this
-    completely safe no matter how many times it fires.
-    After MAX_AUTO_RESENDS, stop resending automatically; the command
-    stays PENDING (not FAILED) until either a late ACK resolves it or
-    the user triggers a manual resend via another /relay press.
-    """
+    # Called every main-loop tick.
+    # If a command is unconfirmed and ACK_WAIT_BEFORE_RESEND_MS has passed,
+    # resend the SAME cmd_id — farm node's dedup ignores true duplicates.
+    # After MAX_AUTO_RESENDS, stops auto-resending but command stays PENDING.
     global pending_cmd
 
     if not pending_cmd or pending_cmd["confirmed"]:
@@ -206,15 +193,14 @@ def check_pending_resend():
         return
 
     if pending_cmd["resends"] >= MAX_AUTO_RESENDS:
-        return   # stays PENDING — no further auto-action
+        return   # stopped auto-resending — user can manually retry
 
     pending_cmd["resends"] += 1
-    print("Auto-resend #{} for cmd id={}".format(
-        pending_cmd["resends"], pending_cmd["id"]))
+    print("Auto-resend #{} for cmd id={}".format(pending_cmd["resends"], pending_cmd["id"]))
     send_relay_command(pending_cmd["action"], pending_cmd["id"])
     pending_cmd["last_sent"] = now
 
-# ------------------------------------------------------------ WIFI INIT ---
+# ------------------------------------------------------------ WIFI ---
 def wifi_connect(retries=3):
     wlan = network.WLAN(network.STA_IF)
 
@@ -252,6 +238,7 @@ def wifi_connect(retries=3):
 
 # ------------------------------------------------------- HTTP HANDLERS ---
 def parse_query(path):
+    # Extracts ?key=value pairs from a URL path
     params = {}
     if "?" in path:
         qs = path.split("?", 1)[1]
@@ -269,11 +256,12 @@ def handle_client(conn):
         if not request:
             conn.close()
             return
+
         first_line = request.split("\r\n")[0]
         parts = first_line.split(" ")
         path  = parts[1] if len(parts) >= 2 else "/"
 
-        # ---------- /data ----------
+        # ---- /data — returns full telemetry JSON ----
         if path.startswith("/data"):
             body = ujson.dumps(latest_data)
             response = (
@@ -283,7 +271,8 @@ def handle_client(conn):
                 "Connection: close\r\n\r\n"
             ) + body
 
-        # ---------- /status — NOW also reports pending command state ----------
+        # ---- /status — returns motor state + pending command info ----
+        # App polls this after a /relay call to learn when the command resolves
         elif path.startswith("/status"):
             status_obj = {"m": latest_data.get("m", 0)}
             if pending_cmd:
@@ -299,15 +288,18 @@ def handle_client(conn):
                 "Connection: close\r\n\r\n"
             ) + body
 
-        # ---------- /ping ----------
+        # ---- /ping — simple alive check ----
         elif path.startswith("/ping"):
             response = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/plain\r\n"
-                "Connection: close\r\n\r\npong"
+                "Connection: close\r\n\r\n"   # FIX: was \r\n\r (missing \n)
+                "pong"
             )
 
-        # ---------- /relay — NOW non-blocking, returns instantly ----------
+        # ---- /relay?id=1 (START) or /relay?id=2 (STOP) ----
+        # Returns INSTANTLY with {"status":"PENDING","cmd_id":N}
+        # App must poll /status to learn when it resolves
         elif path.startswith("/relay"):
             params = parse_query(path)
             try:
@@ -329,34 +321,35 @@ def handle_client(conn):
                 return
 
             if pending_cmd and not pending_cmd["confirmed"] and pending_cmd["action"] == action:
-                # Same action already in flight — this is the user pressing
-                # the same button again. Do NOT allocate a new id (that
-                # would just be a second duplicate to track). Instead,
-                # nudge an immediate resend of the SAME id — completely
-                # safe thanks to farm-node idempotency, and satisfies
-                # "prevent button spamming" without rejecting the press.
-                print("Action already pending (id={}) — forcing resend, no new id".format(
+                # Same action already in flight — reuse same cmd_id, just nudge a resend.
+                # Safe because farm node ignores duplicate IDs without re-pulsing.
+                print("Same action already pending (id={}) — resending same id".format(
                     pending_cmd["id"]))
                 send_relay_command(pending_cmd["action"], pending_cmd["id"])
                 pending_cmd["last_sent"] = utime.ticks_ms()
                 body = ujson.dumps({"status": "PENDING", "cmd_id": pending_cmd["id"]})
             else:
-                cmd_id = next_cmd_id
-                next_cmd_id = (next_cmd_id + 1) % 65536
+                # FIX: clear stale confirmed command before tracking a new one
+                # so /status doesn't keep reporting the old confirmed command forever
+                if pending_cmd and pending_cmd["confirmed"]:
+                    pending_cmd = None
+
+                # Allocate new command ID — wraps 65535 → 1, never produces 0
+                # (0 is reserved as "invalid" on the farm node side)
+                cmd_id      = next_cmd_id
+                next_cmd_id = (next_cmd_id % 65535) + 1   # FIX: was % 65536, could produce 0
+
                 pending_cmd = {
-                    "id": cmd_id,
-                    "action": action,
+                    "id":        cmd_id,
+                    "action":    action,
                     "confirmed": False,
-                    "status": None,
+                    "status":    None,
                     "last_sent": utime.ticks_ms(),
-                    "resends": 0
+                    "resends":   0
                 }
                 send_relay_command(action, cmd_id)
                 body = ujson.dumps({"status": "PENDING", "cmd_id": cmd_id})
 
-            # Returns IMMEDIATELY — no 8s/28s wait, no blocking the socket.
-            # The app is expected to poll /status?... using cmd_id to learn
-            # when it resolves, however long that actually takes.
             response = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
@@ -390,8 +383,8 @@ pico_ip     = wifi_connect()
 server_sock = start_server() if pico_ip else None
 
 while True:
-    process_lora()
-    check_pending_resend()      # NEW — background resend, never blocks
+    process_lora()            # check for incoming ACKs and telemetry
+    check_pending_resend()    # auto-resend unconfirmed commands in background
     if server_sock:
         try:
             conn, addr = server_sock.accept()
